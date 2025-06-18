@@ -33,13 +33,19 @@ class DocumentProcessor:
             return ""
     
     @staticmethod
-    def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-        """Split text into overlapping chunks"""
+    def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+        """Split text into overlapping chunks - reduced size for faster processing"""
         if not text.strip():
             return []
         
         # Clean and normalize text
         text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Limit total text length to prevent timeouts
+        max_chars = 50000  # Limit to 50k characters
+        if len(text) > max_chars:
+            text = text[:max_chars]
+            st.warning(f"Document truncated to {max_chars} characters to prevent timeout.")
         
         chunks = []
         start = 0
@@ -74,7 +80,7 @@ class EmbeddingManager:
         self.embeddings_cache = {}
     
     def get_embeddings(self, texts: List[str]) -> np.ndarray:
-        """Get embeddings for a list of texts using Cohere"""
+        """Get embeddings for a list of texts using Cohere with batching"""
         try:
             # Filter out empty texts
             valid_texts = [text for text in texts if text.strip()]
@@ -82,13 +88,26 @@ class EmbeddingManager:
             if not valid_texts:
                 return np.array([])
             
-            response = co.embed(
-                texts=valid_texts,
-                model='embed-english-v3.0',
-                input_type='search_document'
-            )
+            # Process in smaller batches to avoid timeouts
+            batch_size = 10  # Reduce batch size for faster processing
+            all_embeddings = []
             
-            return np.array(response.embeddings)
+            for i in range(0, len(valid_texts), batch_size):
+                batch = valid_texts[i:i + batch_size]
+                
+                # Show progress
+                progress = (i + len(batch)) / len(valid_texts)
+                st.progress(progress, f"Processing embeddings: {i + len(batch)}/{len(valid_texts)}")
+                
+                response = co.embed(
+                    texts=batch,
+                    model='embed-english-v3.0',
+                    input_type='search_document'
+                )
+                
+                all_embeddings.extend(response.embeddings)
+            
+            return np.array(all_embeddings)
         except Exception as e:
             logger.error(f"Error generating embeddings: {e}")
             st.error(f"Error generating embeddings: {e}")
@@ -117,25 +136,37 @@ class RAGSystem:
         self.chunk_embeddings = None
     
     def process_document(self, pdf_file) -> bool:
-        """Process uploaded PDF and create embeddings"""
+        """Process uploaded PDF and create embeddings with timeout protection"""
         try:
             # Extract text from PDF
-            text = DocumentProcessor.extract_text_from_pdf(pdf_file)
+            with st.spinner("Extracting text from PDF..."):
+                text = DocumentProcessor.extract_text_from_pdf(pdf_file)
             
             if not text.strip():
                 st.error("No text could be extracted from the PDF. Please check if the PDF contains readable text.")
                 return False
             
+            st.success(f"✅ Extracted {len(text)} characters from PDF")
+            
             # Chunk the text
-            self.document_chunks = DocumentProcessor.chunk_text(text)
+            with st.spinner("Creating text chunks..."):
+                self.document_chunks = DocumentProcessor.chunk_text(text)
             
             if not self.document_chunks:
                 st.error("No valid text chunks could be created from the document.")
                 return False
             
+            st.info(f"📄 Created {len(self.document_chunks)} text chunks")
+            
+            # Limit number of chunks to prevent timeout
+            max_chunks = 50  # Limit to 50 chunks for faster processing
+            if len(self.document_chunks) > max_chunks:
+                self.document_chunks = self.document_chunks[:max_chunks]
+                st.warning(f"⚠️ Limited to first {max_chunks} chunks to prevent timeout")
+            
             # Generate embeddings for chunks
-            with st.spinner("Generating embeddings for document chunks..."):
-                self.chunk_embeddings = self.embedding_manager.get_embeddings(self.document_chunks)
+            st.info("🔄 Generating embeddings (this may take a moment)...")
+            self.chunk_embeddings = self.embedding_manager.get_embeddings(self.document_chunks)
             
             if self.chunk_embeddings.size == 0:
                 st.error("Failed to generate embeddings for the document.")
@@ -252,16 +283,23 @@ def main():
         if uploaded_file is not None:
             st.success(f"Uploaded: {uploaded_file.name}")
             
+            # Show file info
+            file_size = len(uploaded_file.getvalue()) / 1024 / 1024  # MB
+            st.caption(f"File size: {file_size:.1f} MB")
+            
+            if file_size > 10:
+                st.warning("⚠️ Large files may take longer to process and might timeout.")
+            
             # Process document button
             if st.button("🔄 Process Document", type="primary"):
-                with st.spinner("Processing document..."):
-                    success = rag_system.process_document(uploaded_file)
-                    if success:
-                        st.success("✅ Document processed successfully!")
-                        st.session_state.document_processed = True
-                    else:
-                        st.error("❌ Failed to process document")
-                        st.session_state.document_processed = False
+                success = rag_system.process_document(uploaded_file)
+                if success:
+                    st.success("✅ Document processed successfully!")
+                    st.session_state.document_processed = True
+                    st.balloons()
+                else:
+                    st.error("❌ Failed to process document")
+                    st.session_state.document_processed = False
         
         # Document info
         if hasattr(st.session_state, 'document_processed') and st.session_state.document_processed:
