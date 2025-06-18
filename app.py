@@ -1,23 +1,33 @@
 import streamlit as st
 import cohere
-import PyPDF2
+import faiss
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-import io
+import PyPDF2
+from io import BytesIO
+import pickle
+import tempfile
+import os
+from typing import List, Dict, Tuple
 import re
-from typing import List, Dict
-import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configure Streamlit page
+st.set_page_config(
+    page_title="RAG Q&A Assistant",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # Initialize Cohere client
-COHERE_API_KEY = "vGCEakgncpouo9Nz0rsJ0Bq7XRvwNgTCZMKSohlg"
-co = cohere.Client(COHERE_API_KEY)
+@st.cache_resource
+def init_cohere():
+    """Initialize Cohere client with API key"""
+    return cohere.Client("vGCEakgncpouo9Nz0rsJ0Bq7XRvwNgTCZMKSohlg")
+
+co = init_cohere()
 
 class DocumentProcessor:
-    """Handle PDF processing and text extraction"""
+    """Class to handle PDF processing and text extraction"""
     
     @staticmethod
     def extract_text_from_pdf(pdf_file) -> str:
@@ -29,251 +39,211 @@ class DocumentProcessor:
                 text += page.extract_text() + "\n"
             return text
         except Exception as e:
-            logger.error(f"Error extracting text from PDF: {e}")
+            st.error(f"Error reading PDF: {str(e)}")
             return ""
     
     @staticmethod
-    def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
-        """Split text into overlapping chunks - reduced size for faster processing"""
-        if not text.strip():
-            return []
-        
-        # Clean and normalize text
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        # Limit total text length to prevent timeouts
-        max_chars = 50000  # Limit to 50k characters
-        if len(text) > max_chars:
-            text = text[:max_chars]
-            st.warning(f"Document truncated to {max_chars} characters to prevent timeout.")
-        
+    def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+        """Split text into overlapping chunks"""
+        words = text.split()
         chunks = []
-        start = 0
         
-        while start < len(text):
-            end = start + chunk_size
-            
-            # If not at the end, try to break at a sentence boundary
-            if end < len(text):
-                # Look for sentence endings in the last 100 characters
-                last_period = text.rfind('.', start, end)
-                last_question = text.rfind('?', start, end)
-                last_exclamation = text.rfind('!', start, end)
-                
-                sentence_end = max(last_period, last_question, last_exclamation)
-                
-                if sentence_end > start + chunk_size // 2:
-                    end = sentence_end + 1
-            
-            chunk = text[start:end].strip()
-            if chunk:
-                chunks.append(chunk)
-            
-            start = end - overlap
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk = " ".join(words[i:i + chunk_size])
+            if chunk.strip():
+                chunks.append(chunk.strip())
         
         return chunks
 
 class EmbeddingManager:
-    """Manage embeddings using Cohere"""
+    """Class to handle embeddings and FAISS operations"""
     
     def __init__(self):
-        self.embeddings_cache = {}
+        self.index = None
+        self.chunks = []
+        self.embeddings = []
     
-    def get_embeddings(self, texts: List[str]) -> np.ndarray:
-        """Get embeddings for a list of texts using Cohere with batching"""
+    def create_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Create embeddings using Cohere"""
         try:
-            # Filter out empty texts
-            valid_texts = [text for text in texts if text.strip()]
-            
-            if not valid_texts:
-                return np.array([])
-            
-            # Process in smaller batches to avoid timeouts
-            batch_size = 10  # Reduce batch size for faster processing
-            all_embeddings = []
-            
-            for i in range(0, len(valid_texts), batch_size):
-                batch = valid_texts[i:i + batch_size]
+            with st.spinner("Creating embeddings..."):
+                # Process in batches to avoid API limits
+                batch_size = 96  # Cohere's batch limit
+                all_embeddings = []
                 
-                # Show progress
-                progress = (i + len(batch)) / len(valid_texts)
-                st.progress(progress, f"Processing embeddings: {i + len(batch)}/{len(valid_texts)}")
+                for i in range(0, len(texts), batch_size):
+                    batch = texts[i:i + batch_size]
+                    response = co.embed(
+                        texts=batch,
+                        model="embed-english-v3.0",
+                        input_type="search_document"
+                    )
+                    all_embeddings.extend(response.embeddings)
                 
-                response = co.embed(
-                    texts=batch,
-                    model='embed-english-v3.0',
-                    input_type='search_document'
-                )
-                
-                all_embeddings.extend(response.embeddings)
-            
-            return np.array(all_embeddings)
+                return np.array(all_embeddings, dtype=np.float32)
         except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
-            st.error(f"Error generating embeddings: {e}")
+            st.error(f"Error creating embeddings: {str(e)}")
             return np.array([])
     
-    def get_query_embedding(self, query: str) -> np.ndarray:
-        """Get embedding for a single query"""
+    def build_faiss_index(self, embeddings: np.ndarray) -> faiss.Index:
+        """Build FAISS index from embeddings"""
         try:
-            response = co.embed(
+            dimension = embeddings.shape[1]
+            index = faiss.IndexFlatIP(dimension)  # Inner product for similarity
+            
+            # Normalize embeddings for cosine similarity
+            faiss.normalize_L2(embeddings)
+            index.add(embeddings)
+            
+            return index
+        except Exception as e:
+            st.error(f"Error building FAISS index: {str(e)}")
+            return None
+    
+    def search_similar_chunks(self, query: str, k: int = 5) -> List[Tuple[str, float]]:
+        """Search for similar chunks using the query"""
+        try:
+            # Create query embedding
+            query_response = co.embed(
                 texts=[query],
-                model='embed-english-v3.0',
-                input_type='search_query'
+                model="embed-english-v3.0",
+                input_type="search_query"
             )
-            return np.array(response.embeddings[0])
+            query_embedding = np.array(query_response.embeddings, dtype=np.float32)
+            faiss.normalize_L2(query_embedding)
+            
+            # Search in FAISS index
+            scores, indices = self.index.search(query_embedding, k)
+            
+            results = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx < len(self.chunks):
+                    results.append((self.chunks[idx], float(score)))
+            
+            return results
         except Exception as e:
-            logger.error(f"Error generating query embedding: {e}")
-            st.error(f"Error generating query embedding: {e}")
-            return np.array([])
+            st.error(f"Error searching similar chunks: {str(e)}")
+            return []
 
 class RAGSystem:
-    """RAG system combining retrieval and generation"""
+    """Main RAG system class"""
     
     def __init__(self):
         self.embedding_manager = EmbeddingManager()
-        self.document_chunks = []
-        self.chunk_embeddings = None
+        self.document_processor = DocumentProcessor()
     
     def process_document(self, pdf_file) -> bool:
-        """Process uploaded PDF and create embeddings with timeout protection"""
+        """Process uploaded PDF and create embeddings"""
         try:
             # Extract text from PDF
-            with st.spinner("Extracting text from PDF..."):
-                text = DocumentProcessor.extract_text_from_pdf(pdf_file)
-            
-            if not text.strip():
-                st.error("No text could be extracted from the PDF. Please check if the PDF contains readable text.")
+            text = self.document_processor.extract_text_from_pdf(pdf_file)
+            if not text:
                 return False
             
-            st.success(f"✅ Extracted {len(text)} characters from PDF")
+            # Clean and preprocess text
+            text = re.sub(r'\s+', ' ', text)  # Remove extra whitespace
+            text = text.strip()
             
             # Chunk the text
-            with st.spinner("Creating text chunks..."):
-                self.document_chunks = DocumentProcessor.chunk_text(text)
-            
-            if not self.document_chunks:
-                st.error("No valid text chunks could be created from the document.")
+            chunks = self.document_processor.chunk_text(text)
+            if not chunks:
+                st.error("No text chunks created from the document")
                 return False
             
-            st.info(f"📄 Created {len(self.document_chunks)} text chunks")
-            
-            # Limit number of chunks to prevent timeout
-            max_chunks = 50  # Limit to 50 chunks for faster processing
-            if len(self.document_chunks) > max_chunks:
-                self.document_chunks = self.document_chunks[:max_chunks]
-                st.warning(f"⚠️ Limited to first {max_chunks} chunks to prevent timeout")
-            
-            # Generate embeddings for chunks
-            st.info("🔄 Generating embeddings (this may take a moment)...")
-            self.chunk_embeddings = self.embedding_manager.get_embeddings(self.document_chunks)
-            
-            if self.chunk_embeddings.size == 0:
-                st.error("Failed to generate embeddings for the document.")
+            # Create embeddings
+            embeddings = self.embedding_manager.create_embeddings(chunks)
+            if embeddings.size == 0:
                 return False
+            
+            # Build FAISS index
+            index = self.embedding_manager.build_faiss_index(embeddings)
+            if index is None:
+                return False
+            
+            # Store in embedding manager
+            self.embedding_manager.index = index
+            self.embedding_manager.chunks = chunks
+            self.embedding_manager.embeddings = embeddings
             
             return True
-            
         except Exception as e:
-            logger.error(f"Error processing document: {e}")
-            st.error(f"Error processing document: {e}")
+            st.error(f"Error processing document: {str(e)}")
             return False
     
-    def retrieve_relevant_chunks(self, query: str, top_k: int = 3) -> List[Dict]:
-        """Retrieve most relevant chunks for a query"""
-        if self.chunk_embeddings is None or len(self.document_chunks) == 0:
-            return []
-        
-        try:
-            # Get query embedding
-            query_embedding = self.embedding_manager.get_query_embedding(query)
-            
-            if query_embedding.size == 0:
-                return []
-            
-            # Calculate similarities
-            similarities = cosine_similarity(
-                query_embedding.reshape(1, -1), 
-                self.chunk_embeddings
-            )[0]
-            
-            # Get top-k most similar chunks
-            top_indices = np.argsort(similarities)[::-1][:top_k]
-            
-            relevant_chunks = []
-            for idx in top_indices:
-                relevant_chunks.append({
-                    'text': self.document_chunks[idx],
-                    'similarity': similarities[idx],
-                    'index': idx
-                })
-            
-            return relevant_chunks
-            
-        except Exception as e:
-            logger.error(f"Error retrieving relevant chunks: {e}")
-            return []
-    
-    def generate_answer(self, query: str, relevant_chunks: List[Dict]) -> str:
+    def generate_answer(self, question: str, context_chunks: List[str]) -> str:
         """Generate answer using Cohere's generation model"""
         try:
-            if not relevant_chunks:
-                return "I couldn't find relevant information in the document to answer your question."
-            
-            # Prepare context from relevant chunks
-            context = "\n\n".join([chunk['text'] for chunk in relevant_chunks])
+            # Prepare context
+            context = "\n\n".join(context_chunks)
             
             # Create prompt
-            prompt = f"""Based on the following context from the document, please answer the question accurately and concisely.
+            prompt = f"""Based on the following context, please answer the question. If the answer cannot be found in the context, please say "I cannot find the answer in the provided context."
 
 Context:
 {context}
 
-Question: {query}
+Question: {question}
 
-Answer: """
+Answer:"""
             
-            # Generate response using Cohere
+            # Generate response
             response = co.generate(
-                model='command-r-plus',
+                model="command",
                 prompt=prompt,
                 max_tokens=500,
                 temperature=0.3,
                 stop_sequences=["Question:", "Context:"]
             )
             
-            answer = response.generations[0].text.strip()
-            
-            # Add source information
-            answer += f"\n\n*Based on {len(relevant_chunks)} relevant sections from the uploaded document.*"
-            
-            return answer
-            
+            return response.generations[0].text.strip()
         except Exception as e:
-            logger.error(f"Error generating answer: {e}")
-            return f"Error generating answer: {e}"
+            st.error(f"Error generating answer: {str(e)}")
+            return "Sorry, I encountered an error while generating the answer."
+    
+    def answer_question(self, question: str) -> Dict:
+        """Main method to answer questions"""
+        if self.embedding_manager.index is None:
+            return {
+                "answer": "Please upload and process a PDF document first.",
+                "sources": []
+            }
+        
+        # Search for relevant chunks
+        similar_chunks = self.embedding_manager.search_similar_chunks(question, k=5)
+        
+        if not similar_chunks:
+            return {
+                "answer": "No relevant information found in the document.",
+                "sources": []
+            }
+        
+        # Extract chunks and scores
+        context_chunks = [chunk for chunk, score in similar_chunks]
+        
+        # Generate answer
+        answer = self.generate_answer(question, context_chunks)
+        
+        return {
+            "answer": answer,
+            "sources": similar_chunks
+        }
 
 # Initialize RAG system
 @st.cache_resource
-def get_rag_system():
+def init_rag_system():
     return RAGSystem()
 
 def main():
-    st.set_page_config(
-        page_title="PDF Q&A with Cohere RAG",
-        page_icon="📚",
-        layout="wide"
-    )
-    
-    st.title("📚 PDF Question Answering with Cohere RAG")
-    st.markdown("Upload a PDF document and ask questions about its content using Cohere's powerful language models.")
+    """Main Streamlit application"""
+    st.title("📚 RAG-based Q&A Assistant")
+    st.markdown("Upload a PDF document and ask questions about its content!")
     
     # Initialize RAG system
-    rag_system = get_rag_system()
+    rag_system = init_rag_system()
     
-    # Sidebar for file upload
+    # Sidebar for document upload
     with st.sidebar:
-        st.header("📁 Document Upload")
+        st.header("📄 Document Upload")
         uploaded_file = st.file_uploader(
             "Choose a PDF file",
             type="pdf",
@@ -281,106 +251,78 @@ def main():
         )
         
         if uploaded_file is not None:
-            st.success(f"Uploaded: {uploaded_file.name}")
+            st.success(f"File uploaded: {uploaded_file.name}")
             
-            # Show file info
-            file_size = len(uploaded_file.getvalue()) / 1024 / 1024  # MB
-            st.caption(f"File size: {file_size:.1f} MB")
-            
-            if file_size > 10:
-                st.warning("⚠️ Large files may take longer to process and might timeout.")
-            
-            # Process document button
-            if st.button("🔄 Process Document", type="primary"):
-                success = rag_system.process_document(uploaded_file)
+            if st.button("Process Document", type="primary"):
+                with st.spinner("Processing document..."):
+                    success = rag_system.process_document(uploaded_file)
+                    
                 if success:
-                    st.success("✅ Document processed successfully!")
+                    st.success("Document processed successfully!")
                     st.session_state.document_processed = True
-                    st.balloons()
                 else:
-                    st.error("❌ Failed to process document")
+                    st.error("Failed to process document")
                     st.session_state.document_processed = False
         
-        # Document info
+        # Display processing status
         if hasattr(st.session_state, 'document_processed') and st.session_state.document_processed:
-            st.info(f"📄 Document ready for questions!\n\nChunks: {len(rag_system.document_chunks)}")
+            st.info("✅ Document ready for questions")
+            
+            # Show document stats
+            if rag_system.embedding_manager.chunks:
+                st.metric("Text Chunks", len(rag_system.embedding_manager.chunks))
+                st.metric("Embeddings", len(rag_system.embedding_manager.embeddings))
     
-    # Main content area
+    # Main area for Q&A
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("💬 Ask Questions")
+        st.header("🤔 Ask Questions")
         
-        # Check if document is processed
-        if not hasattr(st.session_state, 'document_processed') or not st.session_state.document_processed:
-            st.warning("👈 Please upload and process a PDF document first using the sidebar.")
-            return
-        
-        # Query input
-        query = st.text_input(
+        # Question input
+        question = st.text_input(
             "Enter your question:",
             placeholder="What is this document about?",
-            key="question_input"
+            help="Ask any question about the uploaded document"
         )
         
-        # Search button
-        if st.button("🔍 Search", type="primary", disabled=not query.strip()):
-            if query.strip():
-                with st.spinner("Searching for relevant information..."):
-                    # Retrieve relevant chunks
-                    relevant_chunks = rag_system.retrieve_relevant_chunks(query, top_k=3)
-                    
-                    if relevant_chunks:
-                        # Generate answer
-                        with st.spinner("Generating answer..."):
-                            answer = rag_system.generate_answer(query, relevant_chunks)
-                        
-                        # Display answer
-                        st.subheader("📋 Answer")
-                        st.write(answer)
-                        
-                        # Store in session state for reference
-                        if 'qa_history' not in st.session_state:
-                            st.session_state.qa_history = []
-                        
-                        st.session_state.qa_history.append({
-                            'question': query,
-                            'answer': answer,
-                            'relevant_chunks': relevant_chunks
-                        })
-                    else:
-                        st.error("No relevant information found for your question.")
-        
-        # Display Q&A history
-        if hasattr(st.session_state, 'qa_history') and st.session_state.qa_history:
-            st.subheader("📝 Previous Questions")
-            for i, qa in enumerate(reversed(st.session_state.qa_history[-5:])):  # Show last 5 Q&As
-                with st.expander(f"Q: {qa['question'][:50]}..."):
-                    st.write("**Question:**", qa['question'])
-                    st.write("**Answer:**", qa['answer'])
+        if st.button("Get Answer", type="primary") and question:
+            with st.spinner("Searching for answer..."):
+                result = rag_system.answer_question(question)
+            
+            # Display answer
+            st.subheader("Answer:")
+            st.write(result["answer"])
+            
+            # Display sources
+            if result["sources"]:
+                with st.expander("📋 Source Context (click to expand)"):
+                    for i, (chunk, score) in enumerate(result["sources"], 1):
+                        st.markdown(f"**Source {i}** (Similarity: {score:.3f})")
+                        st.text_area(f"Context {i}", chunk, height=100, key=f"source_{i}")
     
     with col2:
-        st.header("ℹ️ How it works")
+        st.header("ℹ️ Instructions")
         st.markdown("""
-        1. **Upload PDF**: Choose a PDF document
-        2. **Process**: Click 'Process Document' to extract and chunk text
-        3. **Embeddings**: Create vector embeddings using Cohere
-        4. **Ask**: Enter your question
-        5. **Retrieve**: Find most relevant text chunks
-        6. **Generate**: Get AI-powered answers using Cohere's language model
+        1. **Upload** a PDF document using the sidebar
+        2. **Process** the document by clicking the button
+        3. **Ask** questions about the document content
+        4. **Review** the answer and source context
+        
+        ### Features:
+        - 🔍 Semantic search using Cohere embeddings
+        - 📊 FAISS vector database for fast retrieval
+        - 🤖 Cohere's language model for answer generation
+        - 📝 Source context for transparency
         """)
         
-        # Show relevant chunks if available
-        if (hasattr(st.session_state, 'qa_history') and 
-            st.session_state.qa_history and 
-            st.session_state.qa_history[-1].get('relevant_chunks')):
-            
-            st.subheader("🎯 Source Chunks")
-            st.caption("Most relevant sections used for the last answer:")
-            
-            for i, chunk in enumerate(st.session_state.qa_history[-1]['relevant_chunks'][:2]):
-                with st.expander(f"Chunk {i+1} (Similarity: {chunk['similarity']:.3f})"):
-                    st.text(chunk['text'][:300] + "..." if len(chunk['text']) > 300 else chunk['text'])
+        st.header("🛠️ Technical Details")
+        st.markdown("""
+        - **Embeddings**: Cohere embed-english-v3.0
+        - **LLM**: Cohere Command model
+        - **Vector DB**: FAISS (Facebook AI Similarity Search)
+        - **Chunking**: 500 words with 50 word overlap
+        """)
 
 if __name__ == "__main__":
     main()
