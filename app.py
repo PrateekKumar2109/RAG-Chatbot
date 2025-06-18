@@ -22,7 +22,7 @@ st.set_page_config(
 @st.cache_resource
 def init_cohere():
     """Initialize Cohere client with API key"""
-    return cohere.Client("vGCEakgncpouo9Nz0rsJ0Bq7XRvwNgTCZMKSohlg")
+    return cohere.Client("YPcYZ15gTNg2O8Hssqq4cyHBiUcwgpUN9uxaQ59y")
 
 co = init_cohere()
 
